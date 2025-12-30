@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Raymarched Water (Fixed)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: linear-gradient(to bottom, #87CEEB 0%, #E0F6FF 100%); }
+    </style>
+</head>
+<body>
+
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+    // --- 1. VERTEX SHADER ---
+    const VERTEX_SHADER = `
+        varying vec3 vWorldPos;
+        varying vec2 vUv;
+
+        void main() {
+            vUv = uv;
+            vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+            vWorldPos = worldPosition.xyz;
+            gl_Position = projectionMatrix * viewMatrix * worldPosition;
+        }
+    `;
+
+    // --- 2. FRAGMENT SHADER (Fixed Logic) ---
+    const FRAGMENT_SHADER = `
+        precision highp float;
+
+        uniform float uTime;
+        uniform vec3 uCameraPos;
+        uniform vec3 uLightDir;
+        uniform vec3 uColorDeep;
+        uniform vec3 uColorShallow;
+        uniform float uWaveSpeed;
+        uniform float uWaveFreq;
+        uniform float uWaveAmp;
+
+        varying vec3 vWorldPos;
+
+        // Wave Function
+        float getWaveHeight(vec2 p) {
+            float dist = length(p);
+            float attenuation = 1.0 / (1.0 + dist * 0.5); 
+            return sin(dist * uWaveFreq - uTime * uWaveSpeed) * uWaveAmp * attenuation;
+        }
+
+        // CORRECTED Intersection Logic
+        float intersectWater(vec3 ro, vec3 rd) {
+            // 1. If looking up, we never hit the water (which is down)
+            if (rd.y >= 0.0) return -1.0;
+
+            // 2. Start the ray exactly at the plane's Y level (y=0.3)
+            // This ensures we start searching from the "glass surface" downwards.
+            float t = (0.3 - ro.y) / rd.y;
+            
+            // 3. Robust Raymarching (Steps down to surface)
+            for(int i = 0; i < 20; i++) {
+                vec3 p = ro + rd * t;       // Current point on ray
+                float h = getWaveHeight(p.xz); // Water height here
+                float hDiff = p.y - h;      // Vertical distance to water
+
+                // If we are very close, stop
+                if(abs(hDiff) < 0.001) break;
+
+                // Move ray forward.
+                // We project the vertical gap (hDiff) along the ray direction.
+                // Since rd.y is negative, we negate it to get a positive step.
+                t += hDiff / -rd.y; 
+            }
+            return t;
+        }
+
+        vec3 getNormal(vec3 p) {
+            float eps = 0.01;
+            float h = getWaveHeight(p.xz);
+            float hx = getWaveHeight(p.xz + vec2(eps, 0.0));
+            float hz = getWaveHeight(p.xz + vec2(0.0, eps));
+            return normalize(vec3(h - hx, eps, h - hz));
+        }
+
+        void main() {
+            vec3 viewDir = normalize(vWorldPos - uCameraPos);
+            
+            // Raymarch
+            float t = intersectWater(uCameraPos, viewDir);
+            
+            // If t < 0, it means we missed or looked up.
+            if(t < 0.0) discard;
+
+            vec3 hitPos = uCameraPos + viewDir * t;
+
+            // --- NO BOUNDARY CHECKS ---
+            // We removed the "if (hitPos.x > 2.5)" block.
+            // The visibility is now naturally limited by the PlaneGeometry itself.
+
+            // Lighting
+            vec3 normal = getNormal(hitPos);
+            vec3 lightDir = normalize(uLightDir);
+            vec3 halfV = normalize(lightDir - viewDir);
+
+            float diff = max(dot(normal, lightDir), 0.0);
+            float spec = pow(max(dot(normal, halfV), 0.0), 120.0) * 1.5;
+            float fresnel = pow(1.0 - max(dot(-viewDir, normal), 0.0), 4.0);
+
+            vec3 col = mix(uColorDeep, uColorShallow, fresnel * 0.5 + diff * 0.2);
+            col += vec3(1.0) * spec;
+
+            gl_FragColor = vec4(col, 1.0);
+            
+            // Gamma
+            gl_FragColor.rgb = pow(gl_FragColor.rgb, vec3(1.0/2.2));
+        }
+    `;
+
+    // --- SETUP ---
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(3, 4, 3);
+    
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // Plane Geometry acts as the "viewport" for the water
+    const geometry = new THREE.PlaneGeometry(5, 5);
+    
+    const uniforms = {
+        uTime: { value: 0 },
+        uCameraPos: { value: new THREE.Vector3() },
+        uLightDir: { value: new THREE.Vector3(1, 2, 0).normalize() },
+        uColorDeep: { value: new THREE.Color(0x0049b6) },
+        uColorShallow: { value: new THREE.Color(0x0084ff) },
+        uWaveSpeed: { value: 2.0 },
+        uWaveFreq: { value: 8.0 },
+        uWaveAmp: { value: 0.15 }
+    };
+
+    const material = new THREE.ShaderMaterial({
+        vertexShader: VERTEX_SHADER,
+        fragmentShader: FRAGMENT_SHADER,
+        uniforms: uniforms,
+        side: THREE.DoubleSide,
+        transparent: true
+    });
+
+    const plane = new THREE.Mesh(geometry, material);
+    plane.rotation.x = -Math.PI / 2;
+    plane.position.y = 0.3; // Water volume top
+    scene.add(plane);
+
+    // GUI
+    const gui = new GUI();
+    const folder = gui.addFolder('Square Water Params');
+    folder.add(uniforms.uWaveAmp, 'value', 0.0, 0.5).name('Height');
+    folder.add(uniforms.uWaveFreq, 'value', 1.0, 20.0).name('Frequency');
+    folder.add(uniforms.uWaveSpeed, 'value', 0.0, 5.0).name('Speed');
+    folder.open();
+
+    const clock = new THREE.Clock();
+
+    function animate() {
+        requestAnimationFrame(animate);
+        uniforms.uTime.value = clock.getElapsedTime();
+        uniforms.uCameraPos.value.copy(camera.position);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>
