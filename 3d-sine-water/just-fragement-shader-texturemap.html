@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Realistic Refraction Water Shader</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #info {
+            position: absolute; top: 10px; left: 10px; color: white; 
+            font-family: sans-serif; pointer-events: none;
+            background: rgba(0,0,0,0.5); padding: 5px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="info">Loading Texture... (Ensure local server is running)</div>
+
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+    // --- 1. VERTEX SHADER ---
+    const vertexShader = `
+        varying vec2 vUv;
+        varying vec3 vViewPosition;
+        varying vec3 vWorldPosition;
+
+        void main() {
+            vUv = uv;
+            
+            vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+            vWorldPosition = worldPosition.xyz;
+            
+            vec4 mvPosition = viewMatrix * worldPosition;
+            vViewPosition = -mvPosition.xyz;
+            
+            gl_Position = projectionMatrix * mvPosition;
+        }
+    `;
+
+    // --- 2. FRAGMENT SHADER (Refraction & Chromatic Aberration) ---
+    const fragmentShader = `
+        precision highp float;
+
+        uniform float uTime;
+        uniform vec3 uColor;
+        uniform vec3 uLightPos;
+        uniform float uWaveSpeed;
+        uniform float uWaveFreq;
+        uniform float uWaveAmp;
+        uniform float uSpecularPower;
+        uniform float uSpecularIntensity;
+        
+        // New Uniforms for Refraction
+        uniform sampler2D uTexture;
+        uniform float uRefractionStrength;
+        uniform float uAbberationStrength;
+
+        varying vec2 vUv;
+        varying vec3 vViewPosition;
+        varying vec3 vWorldPosition;
+
+        // --- Analytical Wave Function ---
+        // Returns vec3(height, gradientX, gradientY)
+        vec3 calculateWave(vec2 uv, float time) {
+            vec2 center = vec2(0.5);
+            vec2 p = uv - center;
+            float dist = length(p);
+            
+            if(dist == 0.0) return vec3(0.0, 0.0, 0.0);
+
+            float phase = dist * uWaveFreq - time * uWaveSpeed;
+            float attenuation = 1.0 / (1.0 + dist * 2.0); 
+            
+            float height = sin(phase) * uWaveAmp * attenuation;
+            float deriv = cos(phase) * uWaveFreq * uWaveAmp * attenuation;
+            vec2 grad = (p / dist) * deriv;
+
+            return vec3(height, grad.x, grad.y);
+        }
+
+        void main() {
+            // 1. Calculate Wave Geometry
+            vec3 wave = calculateWave(vUv, uTime);
+            float h = wave.x;
+            vec2 slope = wave.yz;
+            
+            // 2. Surface Normal
+            // We use the slope to perturb the normal vector
+            vec3 normal = normalize(vec3(-slope.x, -slope.y, 1.0));
+
+            // 3. Refraction / Wobble Math
+            // Instead of sampling the texture at vUv, we offset it based on the normal.
+            // This creates the "magnification" and "swirling" look.
+            vec2 distort = normal.xy * uRefractionStrength;
+            
+            // 4. Chromatic Aberration (RGB Split)
+            // Light bends differently based on wavelength (color).
+            // We sample the texture 3 times at slightly different offsets for realism.
+            float r = texture2D(uTexture, vUv + distort * (1.0 + uAbberationStrength)).r;
+            float g = texture2D(uTexture, vUv + distort).g;
+            float b = texture2D(uTexture, vUv + distort * (1.0 - uAbberationStrength)).b;
+            
+            vec3 seabedColor = vec3(r, g, b);
+
+            // 5. Lighting Setup
+            vec3 viewDir = normalize(vViewPosition);
+            vec3 lightDir = normalize(uLightPos - vWorldPosition);
+            vec3 halfVector = normalize(lightDir + viewDir);
+
+            // Specular (Sun reflection)
+            float NdotH = max(0.0, dot(normal, halfVector));
+            float specular = pow(NdotH, uSpecularPower) * uSpecularIntensity;
+
+            // Fresnel (Reflectivity based on angle)
+            float fresnel = pow(1.0 - max(0.0, dot(viewDir, normal)), 3.0);
+            fresnel = clamp(fresnel, 0.0, 1.0);
+
+            // 6. Composition
+            // Start with the distorted seabed
+            vec3 finalColor = seabedColor;
+            
+            // Tint it with water color (absorption simulation)
+            finalColor = mix(finalColor, uColor, 0.4); 
+
+            // Add Sky reflection (Fresnel)
+            vec3 skyColor = vec3(0.8, 0.9, 1.0);
+            finalColor = mix(finalColor, skyColor, fresnel * 0.4);
+
+            // Add Specular Highlight
+            finalColor += vec3(specular);
+
+            gl_FragColor = vec4(finalColor, 1.0);
+            
+            // Gamma Correction
+            gl_FragColor.rgb = pow(gl_FragColor.rgb, vec3(1.0/2.2));
+        }
+    `;
+
+    // --- 3. SCENE SETUP ---
+    const scene = new THREE.Scene();
+    
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 5, 4);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // --- 4. TEXTURE LOADING ---
+    const textureLoader = new THREE.TextureLoader();
+    
+    // NOTE: Ensure this path exists or use a placeholder URL for testing
+    const texturePath = './assets/underwater-1.jpeg'; 
+    // Fallback checkerboard if image fails (generated in JS)
+    const createPlaceholderTexture = () => {
+        const cvs = document.createElement('canvas'); cvs.width=512; cvs.height=512;
+        const ctx = cvs.getContext('2d');
+        ctx.fillStyle='#333'; ctx.fillRect(0,0,512,512);
+        ctx.fillStyle='#555'; 
+        for(let i=0;i<8;i++) for(let j=0;j<8;j++) if((i+j)%2==0) ctx.fillRect(i*64,j*64,64,64);
+        ctx.fillStyle='white'; ctx.font="40px Arial"; ctx.fillText("Image Not Found", 50, 256);
+        const tex = new THREE.CanvasTexture(cvs);
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        return tex;
+    };
+
+    let seabedTexture;
+    
+    textureLoader.load(
+        texturePath,
+        (tex) => {
+            tex.wrapS = THREE.RepeatWrapping;
+            tex.wrapT = THREE.RepeatWrapping;
+            document.getElementById('info').style.display = 'none';
+            uniforms.uTexture.value = tex;
+            seabedMat.map = tex; // Update floor plane too
+            seabedMat.needsUpdate = true;
+        },
+        undefined,
+        (err) => {
+            console.warn("Texture load failed, using placeholder.");
+            const ph = createPlaceholderTexture();
+            uniforms.uTexture.value = ph;
+            seabedMat.map = ph;
+        }
+    );
+
+    // --- 5. THE PLANES ---
+
+    // A. The Water Surface (Shader Material)
+    const waterGeometry = new THREE.PlaneGeometry(5, 5, 1, 1);
+    
+    const uniforms = {
+        uTime: { value: 0 },
+        uColor: { value: new THREE.Color('#006994') }, // Deep sea blue
+        uLightPos: { value: new THREE.Vector3(2, 5, 2) },
+        uWaveSpeed: { value: 3.0 },
+        uWaveFreq: { value: 20.0 },
+        uWaveAmp: { value: 0.05 },
+        uSpecularPower: { value: 150.0 },
+        uSpecularIntensity: { value: 1.5 },
+        // Refraction settings
+        uTexture: { value: null }, // Will be set by loader
+        uRefractionStrength: { value: 0.15 },
+        uAbberationStrength: { value: 0.5 } // Color splitting strength
+    };
+
+    const waterMaterial = new THREE.ShaderMaterial({
+        vertexShader: vertexShader,
+        fragmentShader: fragmentShader,
+        uniforms: uniforms,
+        side: THREE.DoubleSide
+    });
+
+    const waterPlane = new THREE.Mesh(waterGeometry, waterMaterial);
+    waterPlane.rotation.x = -Math.PI / 2;
+    scene.add(waterPlane);
+
+    // B. The Physical Plane Underneath (1m below)
+    // This is useful if the camera goes underwater or looks from the side,
+    // but the Water Shader creates the main visual "wobble" effect from above.
+    const seabedGeo = new THREE.PlaneGeometry(5, 5);
+    const seabedMat = new THREE.MeshBasicMaterial({ color: 0xffffff }); // Map added on load
+    const seabedPlane = new THREE.Mesh(seabedGeo, seabedMat);
+    seabedPlane.rotation.x = -Math.PI / 2;
+    seabedPlane.position.y = -1.0; 
+    scene.add(seabedPlane);
+
+    // Light Helper
+    const lightHelper = new THREE.Mesh(
+        new THREE.SphereGeometry(0.1), 
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+    );
+    lightHelper.position.copy(uniforms.uLightPos.value);
+    scene.add(lightHelper);
+
+    // --- 6. GUI ---
+    const gui = new GUI();
+    
+    const folderWave = gui.addFolder('Wave & Refraction');
+    folderWave.add(uniforms.uWaveSpeed, 'value', 0.0, 10.0).name('Wave Speed');
+    folderWave.add(uniforms.uWaveFreq, 'value', 1.0, 50.0).name('Wave Freq');
+    folderWave.add(uniforms.uWaveAmp, 'value', 0.0, 0.2).name('Wave Amp');
+    folderWave.add(uniforms.uRefractionStrength, 'value', 0.0, 0.5).name('Wobble Strength');
+    folderWave.add(uniforms.uAbberationStrength, 'value', 0.0, 2.0).name('Chrom. Abberation');
+    folderWave.open();
+
+    const folderLook = gui.addFolder('Look');
+    folderLook.addColor({ c: uniforms.uColor.value.getHex() }, 'c')
+        .name('Water Tint')
+        .onChange(v => uniforms.uColor.value.set(v));
+    folderLook.add(uniforms.uSpecularPower, 'value', 10, 300).name('Spec Sharpness');
+    
+    // Light Control
+    const params = { lx: 2, ly: 5, lz: 2 };
+    const updateLight = () => {
+        uniforms.uLightPos.value.set(params.lx, params.ly, params.lz);
+        lightHelper.position.copy(uniforms.uLightPos.value);
+    };
+    folderLook.add(params, 'lx', -10, 10).onChange(updateLight);
+    folderLook.add(params, 'ly', 0, 10).onChange(updateLight);
+    folderLook.add(params, 'lz', -10, 10).onChange(updateLight);
+
+    // --- 7. LOOP ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+        requestAnimationFrame(animate);
+        uniforms.uTime.value = clock.getElapsedTime();
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+</script>
+</body>
+</html>
